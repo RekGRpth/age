@@ -2823,6 +2823,7 @@ SELECT * FROM cypher('order_by', $$CREATE ({i: false})$$) AS (result agtype);
 SELECT * FROM cypher('order_by', $$CREATE ({i: {key: 'value'}})$$) AS (result agtype);
 SELECT * FROM cypher('order_by', $$CREATE ({i: [1]})$$) AS (result agtype);
 
+
 SELECT * FROM cypher('order_by', $$
 	MATCH (u)
 	RETURN u.i
@@ -2834,6 +2835,35 @@ SELECT * FROM cypher('order_by', $$
 	RETURN u.i
 	ORDER BY u.i DESC
 $$) AS (i agtype);
+
+--
+-- Test ORDER BY with AS
+--
+SELECT * FROM cypher('order_by', $$ CREATE ({name: 'John', age: 38}) $$) AS (result agtype);
+SELECT * FROM cypher('order_by', $$ CREATE ({name: 'Jill', age: 23}) $$) AS (result agtype);
+SELECT * FROM cypher('order_by', $$ CREATE ({name: 'Ion', age: 34}) $$) AS (result agtype);
+SELECT * FROM cypher('order_by', $$ CREATE ({name: 'Mary', age: 57}) $$) AS (result agtype);
+SELECT * FROM cypher('order_by', $$ CREATE ({name: 'Jerry', age: 34}) $$) AS (result agtype);
+
+SELECT * FROM cypher('order_by', $$
+        MATCH (u) WHERE EXISTS(u.name) RETURN u.name AS name, u.age AS age ORDER BY name
+$$) AS (name agtype, age agtype);
+
+SELECT * FROM cypher('order_by', $$
+        MATCH (u) WHERE EXISTS(u.name) RETURN u.name AS name, u.age AS age ORDER BY name ASC
+$$) AS (name agtype, age agtype);
+
+SELECT * FROM cypher('order_by', $$
+        MATCH (u) WHERE EXISTS(u.name) RETURN u.name AS name, u.age AS age ORDER BY name DESC
+$$) AS (name agtype, age agtype);
+
+SELECT * FROM cypher('order_by', $$
+        MATCH (u) WHERE EXISTS(u.name) RETURN u.name AS name, u.age AS age ORDER BY age ASC, name DESCENDING 
+$$) AS (name agtype, age agtype);
+
+SELECT * FROM cypher('order_by', $$
+        MATCH (u) WHERE EXISTS(u.name) RETURN u.name AS name, u.age AS age ORDER BY age DESC, name ASCENDING
+$$) AS (name agtype, age agtype);
 
 --CASE
 SELECT create_graph('case_statement');
@@ -3635,8 +3665,35 @@ SELECT agtype_access_operator(agtype_in('[null, null]'));
 SELECT agtype_hash_cmp(agtype_in('[null, null, null, null, null]'));
 
 --
+-- Issue 2263: AGE returns incorrect error message for EXISTS subquery outer variable reference
+--
+--       NOTE: There isn't really anything incorrect about the message. However,
+--             it could be more clear.
+--
+SELECT * FROM create_graph('issue_2263');
+SELECT * FROM cypher('issue_2263', $$
+    CREATE a=()-[:T]->(), p=({k:exists{return a}})-[:T]->()
+    RETURN 1
+$$) AS (one agtype);
+SELECT * FROM cypher('issue_2263', $$
+    CREATE p0=(n0), (n1{k:EXISTS{WITH p0}})
+    RETURN 1
+$$) AS (one agtype);
+SELECT * FROM cypher('issue_2263', $$
+    CREATE ()-[r4 :T6]->(), ({k2:COUNT{WITH r4.k AS a3 UNWIND [] AS a4 WITH DISTINCT NULL AS a5}})
+    RETURN 1
+$$) AS (one agtype);
+SELECT * FROM cypher('issue_2263', $$
+    CREATE (x), ({a1:EXISTS { RETURN COUNT(0) AS a2, keys(x) AS a4 }})
+$$) AS (out agtype);
+SELECT * FROM cypher('issue_2263', $$
+    CREATE x = (), ({ a0:COUNT { MATCH () WHERE CASE WHEN true THEN (x IS NULL) END RETURN 0 } })
+$$) AS (out agtype);
+
+--
 -- Cleanup
 --
+SELECT * FROM drop_graph('issue_2263', true);
 SELECT * FROM drop_graph('issue_1988', true);
 SELECT * FROM drop_graph('issue_1953', true);
 SELECT * FROM drop_graph('expanded_map', true);
