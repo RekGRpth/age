@@ -71,6 +71,7 @@
 #define AGE_VARNAME_MERGE_CLAUSE AGE_DEFAULT_VARNAME_PREFIX"merge_clause"
 #define AGE_VARNAME_ID AGE_DEFAULT_VARNAME_PREFIX"id"
 #define AGE_VARNAME_SET_CLAUSE AGE_DEFAULT_VARNAME_PREFIX"set_clause"
+#define AGE_VARNAME_SET_VALUE AGE_DEFAULT_VARNAME_PREFIX"set_value"
 
 /*
  * In the transformation stage, we need to track
@@ -344,6 +345,100 @@ static bool isa_special_VLE_case(cypher_path *path);
 
 static ParseNamespaceItem *find_pnsi(cypher_parsestate *cpstate, char *varname);
 static bool has_list_comp_or_subquery(Node *expr, void *context);
+
+/*
+ * Add required permissions to the RTEPermissionInfo for a relation.
+ * Recursively searches through RTEs including subqueries.
+ */
+static bool
+add_rte_permissions_recurse(List *rtable, List *rteperminfos,
+                            Oid relid, AclMode permissions)
+{
+    ListCell *lc;
+
+    /* First check the perminfos at this level */
+    foreach(lc, rteperminfos)
+    {
+        RTEPermissionInfo *perminfo = lfirst(lc);
+
+        if (perminfo->relid == relid)
+        {
+            perminfo->requiredPerms |= permissions;
+            return true;
+        }
+    }
+
+    /* Then recurse into subqueries */
+    foreach(lc, rtable)
+    {
+        RangeTblEntry *rte = lfirst(lc);
+
+        if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
+        {
+            if (add_rte_permissions_recurse(rte->subquery->rtable,
+                                            rte->subquery->rteperminfos,
+                                            relid, permissions))
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Add required permissions to the RTEPermissionInfo for a relation.
+ * Searches through p_rteperminfos and subqueries for a matching relOid
+ * and adds the specified permissions to requiredPerms.
+ */
+static void
+add_rte_permissions(ParseState *pstate, Oid relid, AclMode permissions)
+{
+    add_rte_permissions_recurse(pstate->p_rtable, pstate->p_rteperminfos,
+                                relid, permissions);
+}
+
+/*
+ * Add required permissions to the label table for a given entity variable.
+ * Looks up the entity by variable name, extracts its label, and adds
+ * the specified permissions to the corresponding RTEPermissionInfo.
+ */
+static void
+add_entity_permissions(cypher_parsestate *cpstate, char *var_name,
+                       AclMode permissions)
+{
+    ParseState *pstate = (ParseState *)cpstate;
+    transform_entity *entity;
+    char *label = NULL;
+    Oid relid;
+
+    entity = find_variable(cpstate, var_name);
+    if (entity == NULL)
+    {
+        return;
+    }
+
+    if (entity->type == ENT_VERTEX)
+    {
+        label = entity->entity.node->label;
+    }
+    else if (entity->type == ENT_EDGE)
+    {
+        label = entity->entity.rel->label;
+    }
+
+    if (label == NULL)
+    {
+        return;
+    }
+
+    relid = get_label_relation(label, cpstate->graph_oid);
+    if (OidIsValid(relid))
+    {
+        add_rte_permissions(pstate, relid, permissions);
+    }
+}
 
 /*
  * transform a cypher_clause
@@ -1153,7 +1248,7 @@ static Query *transform_cypher_call_subquery(cypher_parsestate *cpstate,
                                                      EXPR_KIND_FROM_FUNCTION));
 
     /* retrieve the column name from funccall */
-    colName = strVal(linitial(self->funccall->funcname));
+    colName = strVal(llast(self->funccall->funcname));
 
     /* make a targetentry from the funcexpr node */
     tle = makeTargetEntry((Expr *) node,
@@ -1560,6 +1655,9 @@ static List *transform_cypher_delete_item_list(cypher_parsestate *cpstate,
                      parser_errposition(pstate, col->location)));
         }
 
+        /* Add ACL_DELETE permission to the entity's label table */
+        add_entity_permissions(cpstate, val->sval, ACL_DELETE);
+
         add_volatile_wrapper_to_target_entry(query->targetList, resno);
 
         pos = makeInteger(resno);
@@ -1724,6 +1822,9 @@ cypher_update_information *transform_cypher_remove_item_list(
                             variable_name),
                      parser_errposition(pstate, set_item->location)));
         }
+
+        /* Add ACL_UPDATE permission to the entity's label table */
+        add_entity_permissions(cpstate, variable_name, ACL_UPDATE);
 
         add_volatile_wrapper_to_target_entry(query->targetList,
                                              item->entity_position);
@@ -1902,6 +2003,9 @@ cypher_update_information *transform_cypher_set_item_list(
                             parser_errposition(pstate, set_item->location)));
         }
 
+        /* Add ACL_UPDATE permission to the entity's label table */
+        add_entity_permissions(cpstate, variable_name, ACL_UPDATE);
+
         add_volatile_wrapper_to_target_entry(query->targetList,
                                              item->entity_position);
 
@@ -1911,10 +2015,24 @@ cypher_update_information *transform_cypher_set_item_list(
             ((cypher_map*)set_item->expr)->keep_null = set_item->is_add;
         }
 
-        /* create target entry for the new property value */
+        /*
+         * Create target entry for the new property value.
+         *
+         * We use a hidden variable name (AGE_VARNAME_SET_VALUE) for the
+         * SET expression value to prevent column name conflicts. This is
+         * necessary when the same variable is used on both the LHS and RHS
+         * of a SET clause (e.g., SET n.prop = n). Without this, the column
+         * name derived from the expression (e.g., "n") would duplicate the
+         * existing column name from the MATCH clause, causing a "column
+         * reference is ambiguous" error in subsequent clauses like RETURN.
+         *
+         * The hidden variable name will be filtered out by expand_pnsi_attrs
+         * when the targetlist is expanded for subsequent clauses.
+         */
         item->prop_position = (AttrNumber)pstate->p_next_resno;
         target_item = transform_cypher_item(cpstate, set_item->expr, NULL,
-                                            EXPR_KIND_SELECT_TARGET, NULL,
+                                            EXPR_KIND_SELECT_TARGET,
+                                            AGE_VARNAME_SET_VALUE,
                                             false);
 
         if (nodeTag(target_item->expr) == T_Aggref)
@@ -2295,6 +2413,32 @@ static TargetEntry *find_target_list_entry(cypher_parsestate *cpstate,
     Node *expr;
     ListCell *lt;
     TargetEntry *te;
+
+    /*
+     * If the ORDER BY item is a simple identifier, check if it matches
+     * an alias in the target list. This implements SQL99-compliant
+     * alias matching for ORDER BY clauses.
+     */
+    if (IsA(node, ColumnRef))
+    {
+        ColumnRef *cref = (ColumnRef *)node;
+
+        if (list_length(cref->fields) == 1)
+        {
+            char *name = strVal(linitial(cref->fields));
+
+            /* Try to match an alias in the target list */
+            foreach (lt, *target_list)
+            {
+                te = lfirst(lt);
+
+                if (te->resname != NULL && strcmp(te->resname, name) == 0)
+                {
+                    return te;
+                }
+            }
+        }
+    }
 
     expr = transform_cypher_expr(cpstate, node, expr_kind);
 
@@ -3276,13 +3420,13 @@ static FuncCall *prevent_duplicate_edges(cypher_parsestate *cpstate,
 {
     List *edges = NIL;
     ListCell *lc;
-    List *qualified_function_name;
-    String *ag_catalog, *edge_fn;
+    List *qualified_function_name = NULL;
+    String *ag_catalog;
+    String *edge_fn = NULL;
+    bool is_vle_edge = false;
+    int nentities = list_length(entities);
 
     ag_catalog = makeString("ag_catalog");
-    edge_fn = makeString("_ag_enforce_edge_uniqueness");
-
-    qualified_function_name = list_make2(ag_catalog, edge_fn);
 
     /* iterate through each entity, collecting the access node for each edge */
     foreach (lc, entities)
@@ -3298,9 +3442,32 @@ static FuncCall *prevent_duplicate_edges(cypher_parsestate *cpstate,
         }
         else if (entity->type == ENT_VLE_EDGE)
         {
+            is_vle_edge = true;
             edges = lappend(edges, entity->expr);
         }
     }
+
+    if (!is_vle_edge && (nentities >= 5 && nentities <= 9))
+    {
+        if (nentities == 5)
+        {
+            edge_fn = makeString("_ag_enforce_edge_uniqueness2");
+        }
+        else if (nentities == 7)
+        {
+            edge_fn = makeString("_ag_enforce_edge_uniqueness3");
+        }
+        else
+        {
+            edge_fn = makeString("_ag_enforce_edge_uniqueness4");
+        }
+    }
+    else
+    {
+        edge_fn = makeString("_ag_enforce_edge_uniqueness");
+    }
+
+    qualified_function_name = list_make2(ag_catalog, edge_fn);
 
     return makeFuncCall(qualified_function_name, edges, COERCE_SQL_SYNTAX, -1);
 }
@@ -3957,7 +4124,7 @@ static List *transform_map_to_ind_recursive(cypher_parsestate *cpstate,
  *
  * Transforms the map to a list of equality irrespective of
  * value type. For example,
- * 
+ *
  * x.name = 'xyz'
  * x.map = {"city": "abc", "street": {"name": "pqr", "number": 123}}
  * x.list = [9, 8, 7]
@@ -4011,7 +4178,7 @@ static List *transform_map_to_ind_top_level(cypher_parsestate *cpstate,
         qual = (Node *)make_op(pstate, op, lhs, rhs, last_srf, -1);
         quals = lappend(quals, qual);
     }
-    
+
     return quals;
 }
 
@@ -6292,6 +6459,7 @@ transform_cypher_clause_as_subquery(cypher_parsestate *cpstate,
            pstate->p_expr_kind == EXPR_KIND_OTHER ||
            pstate->p_expr_kind == EXPR_KIND_WHERE ||
            pstate->p_expr_kind == EXPR_KIND_SELECT_TARGET ||
+           pstate->p_expr_kind == EXPR_KIND_INSERT_TARGET ||
            pstate->p_expr_kind == EXPR_KIND_FROM_SUBSELECT);
 
     /*

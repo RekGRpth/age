@@ -44,7 +44,10 @@
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "parser/parse_coerce.h"
+#include "nodes/nodes.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "executor/cypher_utils.h"
 #include "utils/float.h"
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
@@ -180,6 +183,17 @@ static int extract_variadic_args_min(FunctionCallInfo fcinfo,
 static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo);
 agtype_value *agtype_composite_to_agtype_value_binary(agtype *a);
 static agtype_value *tostring_helper(Datum arg, Oid type, char *msghdr);
+
+
+void *repalloc_check(void *ptr, size_t len)
+{
+   if (ptr != NULL)
+   {
+       return repalloc(ptr, len);
+   }
+
+   return palloc(len);
+}
 
 /*
  * Due to how pfree can be implemented, it may not check for a passed NULL. This
@@ -5398,10 +5412,24 @@ Datum age_id(PG_FUNCTION_ARGS)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                         errmsg("id() argument must be a vertex, an edge or null")));
 
-    agtv_result = GET_AGTYPE_VALUE_OBJECT_VALUE(agtv_object, "id");
-
-    Assert(agtv_result != NULL);
-    Assert(agtv_result->type = AGTV_INTEGER);
+    /*
+     * Direct field access optimization: id is at a fixed index for both
+     * vertex and edge objects due to key length sorting.
+     */
+    if (agtv_object->type == AGTV_VERTEX)
+    {
+        agtv_result = AGTYPE_VERTEX_GET_ID(agtv_object);
+    }
+    else if (agtv_object->type == AGTV_EDGE)
+    {
+        agtv_result = AGTYPE_EDGE_GET_ID(agtv_object);
+    }
+    else
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("id() unexpected argument type")));
+    }
 
     PG_RETURN_POINTER(agtype_value_to_agtype(agtv_result));
 }
@@ -5436,10 +5464,11 @@ Datum age_start_id(PG_FUNCTION_ARGS)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                         errmsg("start_id() argument must be an edge or null")));
 
-    agtv_result = GET_AGTYPE_VALUE_OBJECT_VALUE(agtv_object, "start_id");
-
-    Assert(agtv_result != NULL);
-    Assert(agtv_result->type = AGTV_INTEGER);
+    /*
+     * Direct field access optimization: start_id is at index 3 for edge
+     * objects due to key length sorting (id=0, label=1, end_id=2, start_id=3).
+     */
+    agtv_result = AGTYPE_EDGE_GET_START_ID(agtv_object);
 
     PG_RETURN_POINTER(agtype_value_to_agtype(agtv_result));
 }
@@ -5474,10 +5503,11 @@ Datum age_end_id(PG_FUNCTION_ARGS)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                         errmsg("end_id() argument must be an edge or null")));
 
-    agtv_result = GET_AGTYPE_VALUE_OBJECT_VALUE(agtv_object, "end_id");
-
-    Assert(agtv_result != NULL);
-    Assert(agtv_result->type = AGTV_INTEGER);
+    /*
+     * Direct field access optimization: end_id is at index 2 for edge
+     * objects due to key length sorting (id=0, label=1, end_id=2).
+     */
+    agtv_result = AGTYPE_EDGE_GET_END_ID(agtv_object);
 
     PG_RETURN_POINTER(agtype_value_to_agtype(agtv_result));
 }
@@ -5580,7 +5610,7 @@ static char *get_label_name(const char *graph_name, graphid element_graphid)
     result = NameStr(*DatumGetName(heap_getattr(tuple, Anum_ag_label_name,
                                                 tupdesc, &column_is_null)));
     /* duplicate it */
-    result = strdup(result);
+    result = pstrdup(result);
 
     /* end the scan and close the relation */
     systable_endscan(scan_desc);
@@ -5598,14 +5628,23 @@ static Datum get_vertex(const char *graph, const char *vertex_label,
     HeapTuple tuple;
     TupleDesc tupdesc;
     Datum id, properties, result;
+    AclResult aclresult;
 
     /* get the specific graph namespace (schema) */
     Oid graph_namespace_oid = get_namespace_oid(graph, false);
     /* get the specific vertex label table (schema.vertex_label) */
     Oid vertex_label_table_oid = get_relname_relid(vertex_label,
-                                                 graph_namespace_oid);
+                                                   graph_namespace_oid);
     /* get the active snapshot */
     Snapshot snapshot = GetActiveSnapshot();
+
+    /* check for SELECT permission on the table */
+    aclresult = pg_class_aclcheck(vertex_label_table_oid, GetUserId(),
+                                  ACL_SELECT);
+    if (aclresult != ACLCHECK_OK)
+    {
+        aclcheck_error(aclresult, OBJECT_TABLE, vertex_label);
+    }
 
     /* initialize the scan key */
     ScanKeyInit(&scan_keys[0], 1, BTEqualStrategyNumber, F_OIDEQ,
@@ -5619,9 +5658,22 @@ static Datum get_vertex(const char *graph, const char *vertex_label,
     /* bail if the tuple isn't valid */
     if (!HeapTupleIsValid(tuple))
     {
+        table_endscan(scan_desc);
+        table_close(graph_vertex_label, ShareLock);
         ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_TABLE),
                  errmsg("graphid %lu does not exist", graphid)));
+    }
+
+    /* Check RLS policies - error if filtered out */
+    if (!check_rls_for_tuple(graph_vertex_label, tuple, CMD_SELECT))
+    {
+        table_endscan(scan_desc);
+        table_close(graph_vertex_label, ShareLock);
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("access to vertex %lu denied by row-level security policy on \"%s\"",
+                        graphid, vertex_label)));
     }
 
     /* get the tupdesc - we don't need to release this one */
@@ -5673,8 +5725,8 @@ Datum age_startnode(PG_FUNCTION_ARGS)
     Assert(AGT_ROOT_IS_SCALAR(agt_arg));
     agtv_object = get_ith_agtype_value_from_container(&agt_arg->root, 0);
     Assert(agtv_object->type == AGTV_STRING);
-    graph_name = strndup(agtv_object->val.string.val,
-                         agtv_object->val.string.len);
+    graph_name = pnstrdup(agtv_object->val.string.val,
+                          agtv_object->val.string.len);
 
     /* get the edge */
     agt_arg = AG_GET_ARG_AGTYPE_P(1);
@@ -5708,8 +5760,6 @@ Datum age_startnode(PG_FUNCTION_ARGS)
 
     result = get_vertex(graph_name, label_name, start_id);
 
-    free(label_name);
-
     return result;
 }
 
@@ -5738,8 +5788,8 @@ Datum age_endnode(PG_FUNCTION_ARGS)
     Assert(AGT_ROOT_IS_SCALAR(agt_arg));
     agtv_object = get_ith_agtype_value_from_container(&agt_arg->root, 0);
     Assert(agtv_object->type == AGTV_STRING);
-    graph_name = strndup(agtv_object->val.string.val,
-                         agtv_object->val.string.len);
+    graph_name = pnstrdup(agtv_object->val.string.val,
+                          agtv_object->val.string.len);
 
     /* get the edge */
     agt_arg = AG_GET_ARG_AGTYPE_P(1);
@@ -5772,8 +5822,6 @@ Datum age_endnode(PG_FUNCTION_ARGS)
     Assert(label_name != NULL);
 
     result = get_vertex(graph_name, label_name, end_id);
-
-    free(label_name);
 
     return result;
 }
@@ -6031,10 +6079,25 @@ Datum age_properties(PG_FUNCTION_ARGS)
                         errmsg("properties() argument must be a vertex, an edge or null")));
     }
 
-    agtv_result = GET_AGTYPE_VALUE_OBJECT_VALUE(agtv_object, "properties");
-
-    Assert(agtv_result != NULL);
-    Assert(agtv_result->type = AGTV_OBJECT);
+    /*
+     * Direct field access optimization: properties is at index 2 for vertex
+     * (id=0, label=1, properties=2) and index 4 for edge (id=0, label=1,
+     * end_id=2, start_id=3, properties=4) due to key length sorting.
+     */
+    if (agtv_object->type == AGTV_VERTEX)
+    {
+        agtv_result = AGTYPE_VERTEX_GET_PROPERTIES(agtv_object);
+    }
+    else if (agtv_object->type == AGTV_EDGE)
+    {
+        agtv_result = AGTYPE_EDGE_GET_PROPERTIES(agtv_object);
+    }
+    else
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("properties() unexpected argument type")));
+    }
 
     PG_RETURN_POINTER(agtype_value_to_agtype(agtv_result));
 }
@@ -6401,11 +6464,10 @@ Datum age_tofloat(PG_FUNCTION_ARGS)
                 NumericGetDatum(agtv_value->val.numeric)));
         else if (agtv_value->type == AGTV_STRING)
         {
-            string = strndup(agtv_value->val.string.val,
-                             agtv_value->val.string.len);
+            string = pnstrdup(agtv_value->val.string.val,
+                              agtv_value->val.string.len);
             result = float8in_internal_null(string, NULL, "double precision",
                                             string, &is_valid);
-            free(string);
             if (!is_valid)
                 PG_RETURN_NULL();
         }
@@ -6703,8 +6765,8 @@ Datum age_tointeger(PG_FUNCTION_ARGS)
         {
             char *endptr;
             /* we need a null terminated cstring */
-            string = strndup(agtv_value->val.string.val,
-                             agtv_value->val.string.len);
+            string = pnstrdup(agtv_value->val.string.val,
+                              agtv_value->val.string.len);
             /* convert it if it is a regular integer string */
             result = strtoi64(string, &endptr, 10);
 
@@ -6718,7 +6780,6 @@ Datum age_tointeger(PG_FUNCTION_ARGS)
 
                 f = float8in_internal_null(string, NULL, "double precision",
                                            string, &is_valid);
-                free(string);
                 /*
                  * If the conversions failed or it's a special float value,
                  * return null.
@@ -6730,10 +6791,6 @@ Datum age_tointeger(PG_FUNCTION_ARGS)
                 }
 
                 result = (int64) f;
-            }
-            else
-            {
-                free(string);
             }
         }
         else
@@ -7169,8 +7226,24 @@ Datum age_label(PG_FUNCTION_ARGS)
 
     }
 
-    /* extract the label agtype value from the vertex or edge */
-    label = GET_AGTYPE_VALUE_OBJECT_VALUE(agtv_value, "label");
+    /*
+     * Direct field access optimization: label is at a fixed index for both
+     * vertex and edge objects due to key length sorting.
+     */
+    if (agtv_value->type == AGTV_VERTEX)
+    {
+        label = AGTYPE_VERTEX_GET_LABEL(agtv_value);
+    }
+    else if (agtv_value->type == AGTV_EDGE)
+    {
+        label = AGTYPE_EDGE_GET_LABEL(agtv_value);
+    }
+    else
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("label() unexpected argument type")));
+    }
 
     PG_RETURN_POINTER(agtype_value_to_agtype(label));
 }
@@ -10506,6 +10579,59 @@ agtype *get_one_agtype_from_variadic_args(FunctionCallInfo fcinfo,
     Oid *types = NULL;
     agtype *agtype_result = NULL;
 
+    /*
+     * Fast path optimization: For non-variadic calls where the argument
+     * is already an agtype, we can avoid the overhead of extract_variadic_args
+     * which allocates three arrays. This is the common case for most agtype
+     * comparison and arithmetic operators.
+     */
+    if (!get_fn_expr_variadic(fcinfo->flinfo))
+    {
+        int total_args = PG_NARGS();
+        int actual_nargs = total_args - variadic_offset;
+
+        /* Verify expected number of arguments */
+        if (actual_nargs != expected_nargs)
+        {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                            errmsg("number of args %d does not match expected %d",
+                                   actual_nargs, expected_nargs)));
+        }
+
+        /* Check for SQL NULL */
+        if (PG_ARGISNULL(variadic_offset))
+        {
+            return NULL;
+        }
+
+        /* Check if the argument is already an agtype */
+        if (get_fn_expr_argtype(fcinfo->flinfo, variadic_offset) == AGTYPEOID)
+        {
+            agtype_container *agtc;
+
+            agtype_result = DATUM_GET_AGTYPE_P(PG_GETARG_DATUM(variadic_offset));
+            agtc = &agtype_result->root;
+
+            /*
+             * Is this a scalar (scalars are stored as one element arrays)?
+             * If so, test for agtype NULL.
+             */
+            if (AGTYPE_CONTAINER_IS_SCALAR(agtc) &&
+                AGTE_IS_NULL(agtc->children[0]))
+            {
+                return NULL;
+            }
+
+            return agtype_result;
+        }
+
+        /*
+         * Not an agtype, need to convert. Fall through to use
+         * extract_variadic_args for type conversion handling.
+         */
+    }
+
+    /* Standard path using extract_variadic_args */
     nargs = extract_variadic_args(fcinfo, variadic_offset, false, &args, &types,
                                   &nulls);
     /* throw an error if the number of args is not the expected number */
