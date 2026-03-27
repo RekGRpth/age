@@ -112,7 +112,9 @@ REGRESS = scan \
           name_validation \
           jsonb_operators \
           list_comprehension \
-          map_projection
+          map_projection \
+          direct_field_access \
+          security
 
 ifneq ($(EXTRA_TESTS),)
   REGRESS += $(EXTRA_TESTS)
@@ -138,6 +140,10 @@ PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+# 32-bit platform support: pass SIZEOF_DATUM=4 to enable (e.g., make SIZEOF_DATUM=4)
+# When SIZEOF_DATUM=4, PASSEDBYVALUE is stripped from graphid type for pass-by-reference.
+# If not specified, normal 64-bit behavior is used (PASSEDBYVALUE preserved).
+
 src/backend/parser/cypher_keywords.o: src/include/parser/cypher_kwlist_d.h
 
 src/include/parser/cypher_kwlist_d.h: src/include/parser/cypher_kwlist.h $(GEN_KEYWORDLIST_DEPS)
@@ -147,11 +153,19 @@ src/include/parser/cypher_gram_def.h: src/backend/parser/cypher_gram.c
 
 src/backend/parser/cypher_gram.c: BISONFLAGS += --defines=src/include/parser/cypher_gram_def.h
 
-src/backend/parser/cypher_parser.o: src/backend/parser/cypher_gram.c
-src/backend/parser/cypher_keywords.o: src/backend/parser/cypher_gram.c
+src/backend/parser/cypher_parser.o: src/backend/parser/cypher_gram.c src/include/parser/cypher_gram_def.h
+src/backend/parser/cypher_parser.bc: src/backend/parser/cypher_gram.c src/include/parser/cypher_gram_def.h
+src/backend/parser/cypher_keywords.o: src/backend/parser/cypher_gram.c src/include/parser/cypher_gram_def.h
+src/backend/parser/cypher_keywords.bc: src/backend/parser/cypher_gram.c src/include/parser/cypher_gram_def.h
 
-$(age_sql):
+# Strip PASSEDBYVALUE on 32-bit (SIZEOF_DATUM=4) for graphid pass-by-reference
+$(age_sql): $(SQLS)
 	@cat $(SQLS) > $@
+ifeq ($(SIZEOF_DATUM),4)
+	@echo "32-bit build: removing PASSEDBYVALUE from graphid type"
+	@sed 's/^  PASSEDBYVALUE,$$/  -- PASSEDBYVALUE removed for 32-bit (see Makefile)/' $@ > $@.tmp && mv $@.tmp $@
+	@grep -q 'PASSEDBYVALUE removed for 32-bit' $@ || { echo "Error: PASSEDBYVALUE replacement failed in $@"; exit 1; }
+endif
 
 src/backend/parser/ag_scanner.c: FLEX_NO_BACKUP=yes
 

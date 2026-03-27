@@ -423,9 +423,11 @@ static Node *transform_ColumnRef(cypher_parsestate *cpstate, ColumnRef *cref)
                 else
                 {
                     ereport(ERROR,
-                                (errcode(ERRCODE_UNDEFINED_COLUMN),
-                                 errmsg("could not find rte for %s", colname),
-                                 parser_errposition(pstate, cref->location)));
+                            (errcode(ERRCODE_UNDEFINED_COLUMN),
+                             errmsg("could not find rte for %s", colname),
+                             errhint("variable %s does not exist within scope of usage",
+                                     colname),
+                             parser_errposition(pstate, cref->location)));
                 }
 
                 if (node == NULL)
@@ -598,6 +600,34 @@ static Node *transform_AEXPR_IN(cypher_parsestate *cpstate, A_Expr *a)
 
     Assert(is_ag_node(a->rexpr, cypher_list));
 
+    rexpr = (cypher_list *)a->rexpr;
+
+    /*
+     * Handle empty list case: x IN [] is always false, x NOT IN [] is always true.
+     * We need to check this before processing to avoid returning NULL result
+     * which causes "cache lookup failed for type 0" error.
+     */
+    if (rexpr->elems == NIL || list_length((List *)rexpr->elems) == 0)
+    {
+        Datum bool_value;
+        Const *const_result;
+
+        /* If operator is <> (NOT IN), result is true; otherwise (IN) result is false */
+        if (strcmp(strVal(linitial(a->name)), "<>") == 0)
+        {
+            bool_value = BoolGetDatum(true);
+        }
+        else
+        {
+            bool_value = BoolGetDatum(false);
+        }
+
+        const_result = makeConst(BOOLOID, -1, InvalidOid, sizeof(bool),
+                                 bool_value, false, true);
+
+        return (Node *)const_result;
+    }
+
     /* If the operator is <>, combine with AND not OR. */
     if (strcmp(strVal(linitial(a->name)), "<>") == 0)
     {
@@ -611,8 +641,6 @@ static Node *transform_AEXPR_IN(cypher_parsestate *cpstate, A_Expr *a)
     lexpr = transform_cypher_expr_recurse(cpstate, a->lexpr);
 
     rexprs = rvars = rnonvars = NIL;
-
-    rexpr = (cypher_list *)a->rexpr;
 
     foreach(l, (List *) rexpr->elems)
     {
@@ -2036,7 +2064,7 @@ static Node *transform_FuncCall(cypher_parsestate *cpstate, FuncCall *fn)
                 targs = lcons(c, targs);
             }
         }
-        /* 
+        /*
          * If it's not in age, check if it's a potential call to some function
          * in another installed extension.
          */
@@ -2055,14 +2083,13 @@ static Node *transform_FuncCall(cypher_parsestate *cpstate, FuncCall *fn)
                                                          procform, extension);
                 return retval;
             }
+            /*
+             * Else we have a function that is in the search_path, and not
+             * qualified, but is not in an extension. Pass it through.
+             */
             else
             {
-                ereport(ERROR,
-                        (errcode(ERRCODE_UNDEFINED_FUNCTION),
-                        errmsg("function %s does not exist", name),
-                        errhint("If the function is from an external extension, "
-                                "make sure the extension is installed and the "
-                                "function is in the search path.")));
+                fname = fn->funcname;
             }
         }
         /* no function found */
