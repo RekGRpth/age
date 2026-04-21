@@ -6056,11 +6056,11 @@ Datum age_tail(PG_FUNCTION_ARGS)
 
     count = AGT_ROOT_COUNT(agt_arg);
 
-    /* if we have an empty list or only one element in the list, return null */
-    if (count <= 1)
-    {
-        PG_RETURN_NULL();
-    }
+    /*
+     * For an empty or singleton list, tail() returns an empty list. The loop
+     * below already produces that result (i starts at 1 so nothing is pushed
+     * when count <= 1), so we do not special-case the count here.
+     */
 
     /* clear the result structure */
     MemSet(&agis_result, 0, sizeof(agtype_in_state));
@@ -8639,8 +8639,15 @@ Datum age_substring(PG_FUNCTION_ARGS)
         PG_RETURN_NULL();
     }
 
-    /* neither offset or length can be null if there is a valid string */
-    if ((nargs == 2 && nulls[1]) ||
+    /*
+     * neither offset nor length may be null when there is a valid string.
+     * Both arg positions must be checked whenever they are supplied; the
+     * previous condition missed the `start is null, length is provided`
+     * case (nargs == 3 && nulls[1]), which fell through to the numeric
+     * parser below and dereferenced an undefined Datum - crashing the
+     * backend (#2386).
+     */
+    if ((nargs >= 2 && nulls[1]) ||
         (nargs == 3 && nulls[2]))
     {
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
