@@ -38,6 +38,13 @@
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
+#include "catalog/pg_proc.h"
+#include "nodes/nodeFuncs.h"
+#include "utils/json.h"
+#include "utils/jsonb.h"
+#include "utils/jsonpath.h"
+#include "utils/plancache.h"
 #include "utils/rls.h"
 #include "utils/acl.h"
 #include "utils/inval.h"
@@ -120,6 +127,18 @@ static GraphVersionState *shmem_version_state = NULL;
 
 /* internal data structures implementation */
 
+/*
+ * Where an entry's properties come from. An entry normally keeps its tuple's
+ * location and reads the properties when a path is materialized. An RLS load
+ * for a role that holds only column privileges cannot read ctid, so it keeps
+ * an owned copy of the properties instead.
+ */
+typedef union entry_storage
+{
+    ItemPointerData tid;           /* physical tuple location for lazy fetch */
+    Datum properties;              /* owned, detoasted properties */
+} entry_storage;
+
 /* vertex entry for the vertex_hashtable */
 typedef struct vertex_entry
 {
@@ -128,7 +147,8 @@ typedef struct vertex_entry
     VertexEdgeArray edges_out;     /* outgoing edge graphids (flat array) */
     VertexEdgeArray edges_self;    /* self-loop edge graphids (flat array) */
     Oid vertex_label_table_oid;    /* the label table oid */
-    ItemPointerData tid;           /* physical tuple location for lazy fetch */
+    bool has_properties;           /* storage holds properties, not a tid */
+    entry_storage storage;         /* tuple location or properties */
 } vertex_entry;
 
 /*
@@ -145,7 +165,8 @@ typedef struct vertex_entry
 typedef struct edge_entry
 {
     Oid edge_label_table_oid;      /* the label table oid */
-    ItemPointerData tid;           /* physical tuple location for lazy fetch */
+    bool has_properties;           /* storage holds properties, not a tid */
+    entry_storage storage;         /* tuple location or properties */
     graphid start_vertex_id;       /* start vertex */
     graphid end_vertex_id;         /* end vertex */
 } edge_entry;
@@ -162,6 +183,7 @@ typedef struct GRAPH_global_context
     HTAB *vertex_hashtable;        /* hashtable to hold vertex edge lists */
     AgeHashTable *edge_table;      /* edge to vertex map (Robin Hood) */
     MemoryContext edge_table_mcxt; /* private context owning edge_table */
+    MemoryContext properties_mcxt; /* owns entry property copies, if any */
     uint64 graph_version;          /* version counter for cache invalidation */
     TransactionId xmin;            /* snapshot fallback: transaction xmin */
     TransactionId xmax;            /* snapshot fallback: transaction xmax */
@@ -170,7 +192,10 @@ typedef struct GRAPH_global_context
     bool loaded_rls_enforced;      /* age.enforce_rls_in_traversal value at load */
     bool vertices_rls_filtered;    /* true if any vertex label was RLS-filtered at load */
     bool loaded_with_rls;          /* true if any label was loaded through RLS (SPI) */
+    bool rls_quals_vary;           /* RLS quals can vary in a statement */
     bool security_invalidated;     /* set by ACL/RLS catalog inval callbacks */
+    bool retired;                  /* not offered to new acquisitions */
+    int pin_count;                 /* queries still using this context */
     List *label_table_oids;        /* label table OIDs, for targeted security inval */
     int64 num_loaded_vertices;     /* number of loaded vertices in this graph */
     int64 num_loaded_edges;        /* number of loaded edges in this graph */
@@ -180,6 +205,24 @@ typedef struct GRAPH_global_context
 
 /* global variable to hold the per process GRAPH global contexts */
 static GRAPH_global_context *global_graph_contexts = NULL;
+
+/*
+ * A query that traverses a graph pins its context until the query's memory
+ * context is reset or deleted. Results of the traversal can be materialized
+ * after the traversal itself has finished, so a pinned context is retired
+ * instead of freed when it becomes invalid.
+ */
+typedef struct GRAPH_context_pin
+{
+    GRAPH_global_context *ggctx;   /* pinned graph context */
+    MemoryContext owner;           /* per-query memory context holding it */
+    const void *call_site;         /* traversal call site that pinned it */
+    MemoryContextCallback release; /* unpins when owner goes away */
+    struct GRAPH_context_pin *next;
+} GRAPH_context_pin;
+
+/* backend-local list of live pins */
+static GRAPH_context_pin *graph_context_pins = NULL;
 
 /*
  * VertexEdgeArray helpers — flat-array adjacency container used by
@@ -235,6 +278,7 @@ static void load_GRAPH_global_hashtables(GRAPH_global_context *ggctx);
 static void load_vertex_hashtable(GRAPH_global_context *ggctx);
 static void load_edge_hashtable(GRAPH_global_context *ggctx);
 static void enforce_label_table_select_acl(Oid label_table_oid);
+static void prevent_rls_load_in_parallel_mode(void);
 static void register_ggctx_security_callbacks(void);
 static void ggctx_security_relcache_callback(Datum arg, Oid relid);
 static void ggctx_security_syscache_callback(Datum arg, int cacheid,
@@ -243,20 +287,28 @@ static void freeze_GRAPH_global_hashtables(GRAPH_global_context *ggctx);
 static List *get_ag_labels_names(Snapshot snapshot, Oid graph_oid,
                                  char label_type);
 static bool insert_edge_entry(GRAPH_global_context *ggctx, graphid edge_id,
-                              ItemPointerData tid, graphid start_vertex_id,
+                              ItemPointerData tid, Datum properties,
+                              graphid start_vertex_id,
                               graphid end_vertex_id, Oid edge_label_table_oid);
 static bool insert_vertex_edge(GRAPH_global_context *ggctx,
                                graphid start_vertex_id, graphid end_vertex_id,
                                graphid edge_id, char *edge_label_name);
 static bool insert_vertex_entry(GRAPH_global_context *ggctx, graphid vertex_id,
                                 Oid vertex_label_table_oid,
-                                ItemPointerData tid);
+                                ItemPointerData tid, Datum properties);
 static void load_vertex_label_rls(GRAPH_global_context *ggctx,
                                   Oid vertex_label_table_oid,
                                   char *vertex_label_name);
 static void load_edge_label_rls(GRAPH_global_context *ggctx,
                                 Oid edge_label_table_oid,
                                 char *edge_label_name);
+static bool rls_function_not_immutable(Oid func_id, void *context);
+static bool rls_quals_vary_walker(Node *node, void *context);
+static bool rls_plan_quals_vary(SPIPlanPtr plan);
+static void unlink_GRAPH_global_context(GRAPH_global_context *ggctx);
+static void release_GRAPH_context_pin(void *arg);
+static bool graph_context_reusable(GRAPH_context_pin *pin,
+                                   const void *call_site);
 /* definitions */
 
 /*
@@ -272,6 +324,12 @@ static void load_edge_label_rls(GRAPH_global_context *ggctx,
  */
 bool is_ggctx_invalid(GRAPH_global_context *ggctx)
 {
+    /* a retired context is only kept for the queries still pinning it */
+    if (ggctx->retired)
+    {
+        return true;
+    }
+
     /*
      * Security-relevant cache keys, checked before the version-counter
      * fast-path below. A cache that applied row-level security is never safe
@@ -580,10 +638,12 @@ static List *get_ag_labels_names(Snapshot snapshot, Oid graph_oid,
 
 /*
  * Helper function to insert one edge/edge->vertex, key/value pair, in the
- * current GRAPH global edge hashtable.
+ * current GRAPH global edge hashtable. A non-zero properties datum is an owned
+ * copy that the entry keeps instead of the tuple location.
  */
 static bool insert_edge_entry(GRAPH_global_context *ggctx, graphid edge_id,
-                              ItemPointerData tid, graphid start_vertex_id,
+                              ItemPointerData tid, Datum properties,
+                              graphid start_vertex_id,
                               graphid end_vertex_id, Oid edge_label_table_oid)
 {
     edge_entry *ee = NULL;
@@ -626,7 +686,15 @@ static bool insert_edge_entry(GRAPH_global_context *ggctx, graphid edge_id,
      * in only the fields we care about. The hash key (edge_id) lives in the
      * slot header; recoverable via get_edge_entry_id() if needed.
      */
-    ee->tid = tid;
+    if (properties != (Datum) 0)
+    {
+        ee->has_properties = true;
+        ee->storage.properties = properties;
+    }
+    else
+    {
+        ee->storage.tid = tid;
+    }
     ee->start_vertex_id = start_vertex_id;
     ee->end_vertex_id = end_vertex_id;
     ee->edge_label_table_oid = edge_label_table_oid;
@@ -639,11 +707,12 @@ static bool insert_edge_entry(GRAPH_global_context *ggctx, graphid edge_id,
 
 /*
  * Helper function to insert an entire vertex into the current GRAPH global
- * vertex hashtable. It will return false if there is a duplicate.
+ * vertex hashtable. It will return false if there is a duplicate. A non-zero
+ * properties datum is an owned copy kept instead of the tuple location.
  */
 static bool insert_vertex_entry(GRAPH_global_context *ggctx, graphid vertex_id,
                                 Oid vertex_label_table_oid,
-                                ItemPointerData tid)
+                                ItemPointerData tid, Datum properties)
 {
     vertex_entry *ve = NULL;
     bool found = false;
@@ -685,8 +754,16 @@ static bool insert_vertex_entry(GRAPH_global_context *ggctx, graphid vertex_id,
     ve->vertex_id = vertex_id;
     /* set the label table oid for this vertex */
     ve->vertex_label_table_oid = vertex_label_table_oid;
-    /* set the TID for lazy property fetch */
-    ve->tid = tid;
+    /* keep the properties, or the TID for a lazy property fetch */
+    if (properties != (Datum) 0)
+    {
+        ve->has_properties = true;
+        ve->storage.properties = properties;
+    }
+    else
+    {
+        ve->storage.tid = tid;
+    }
     /*
      * MemSet above already zeroed the embedded VertexEdgeArray fields
      * (array=NULL, size=0, capacity=0); no explicit NIL assignment needed.
@@ -786,18 +863,196 @@ static bool insert_vertex_edge(GRAPH_global_context *ggctx,
     return false;
 }
 
+/* checker for check_functions_in_node: a function that is not IMMUTABLE */
+static bool rls_function_not_immutable(Oid func_id, void *context)
+{
+    return (func_volatile(func_id) != PROVOLATILE_IMMUTABLE);
+}
+
+/*
+ * PostgreSQL's contain_mutable_functions_walker, except for the SQL value
+ * functions whose result cannot change during a statement without the reuse
+ * check noticing: the date and time ones are fixed for the transaction,
+ * CURRENT_ROLE, CURRENT_USER and USER are the current role, which the reuse
+ * check compares, and CURRENT_CATALOG is fixed for the session. SESSION_USER
+ * and CURRENT_SCHEMA can change within a statement.
+ */
+static bool rls_quals_vary_walker(Node *node, void *context)
+{
+    if (node == NULL)
+    {
+        return false;
+    }
+
+    if (check_functions_in_node(node, rls_function_not_immutable, context))
+    {
+        return true;
+    }
+
+    if (IsA(node, JsonConstructorExpr))
+    {
+        JsonConstructorExpr *ctor = (JsonConstructorExpr *) node;
+        bool is_jsonb = (ctor->returning->format->format_type ==
+                         JS_FORMAT_JSONB);
+        ListCell *lc;
+
+        foreach (lc, ctor->args)
+        {
+            Oid typid = exprType(lfirst(lc));
+
+            if (is_jsonb ? !to_jsonb_is_immutable(typid) :
+                           !to_json_is_immutable(typid))
+            {
+                return true;
+            }
+        }
+    }
+
+    if (IsA(node, JsonExpr))
+    {
+        JsonExpr *jexpr = (JsonExpr *) node;
+        Const *cnst;
+
+        if (!IsA(jexpr->path_spec, Const))
+        {
+            return true;
+        }
+
+        cnst = (Const *) jexpr->path_spec;
+        if (cnst->constisnull)
+        {
+            return false;
+        }
+
+        if (jspIsMutable(DatumGetJsonPathP(cnst->constvalue),
+                         jexpr->passing_names, jexpr->passing_values))
+        {
+            return true;
+        }
+    }
+
+    if (IsA(node, SQLValueFunction))
+    {
+        switch (((SQLValueFunction *) node)->op)
+        {
+        case SVFOP_CURRENT_DATE:
+        case SVFOP_CURRENT_TIME:
+        case SVFOP_CURRENT_TIME_N:
+        case SVFOP_CURRENT_TIMESTAMP:
+        case SVFOP_CURRENT_TIMESTAMP_N:
+        case SVFOP_LOCALTIME:
+        case SVFOP_LOCALTIME_N:
+        case SVFOP_LOCALTIMESTAMP:
+        case SVFOP_LOCALTIMESTAMP_N:
+        case SVFOP_CURRENT_ROLE:
+        case SVFOP_CURRENT_USER:
+        case SVFOP_USER:
+        case SVFOP_CURRENT_CATALOG:
+            return false;
+        default:
+            return true;
+        }
+    }
+
+    if (IsA(node, NextValueExpr))
+    {
+        return true;
+    }
+
+    if (IsA(node, Query))
+    {
+        return query_tree_walker((Query *) node, rls_quals_vary_walker,
+                                 context, 0);
+    }
+
+    return expression_tree_walker(node, rls_quals_vary_walker, context);
+}
+
+/*
+ * Whether the row-security quals the planner applied to an RLS load can give
+ * another result later in the same statement, so that another scan of the
+ * label could return other rows. They can when they call a function that is
+ * not IMMUTABLE: a volatile one, or a STABLE one such as current_setting(),
+ * whose input the statement itself can change with set_config(). Policies
+ * from row_security_policy_hook_permissive and _restrictive are turned into
+ * the same securityQuals as catalog policies, so they are inspected too. A
+ * plan whose queries cannot be inspected is reported as varying; reuse is
+ * then limited to the call site that loaded the graph, which is valid for any
+ * policy.
+ */
+static bool rls_plan_quals_vary(SPIPlanPtr plan)
+{
+    List *sources;
+    ListCell *source_cell;
+
+    sources = SPI_plan_get_plan_sources(plan);
+    if (sources == NIL)
+    {
+        return true;
+    }
+
+    foreach (source_cell, sources)
+    {
+        CachedPlanSource *source = lfirst(source_cell);
+        ListCell *query_cell;
+
+        if (source->query_list == NIL)
+        {
+            return true;
+        }
+
+        foreach (query_cell, source->query_list)
+        {
+            /* walks the range table's securityQuals and any sublinks */
+            if (rls_quals_vary_walker(lfirst(query_cell), NULL))
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Keep an owned, detoasted copy of an entry's properties in the context's
+ * property memory, which is freed with the context.
+ */
+static Datum copy_entry_properties(GRAPH_global_context *ggctx,
+                                   MemoryContext parent, Datum properties)
+{
+    MemoryContext oldctx;
+    Datum copy;
+
+    if (ggctx->properties_mcxt == NULL)
+    {
+        ggctx->properties_mcxt = AllocSetContextCreate(parent,
+                                                       "AGE entry properties",
+                                                       ALLOCSET_DEFAULT_SIZES);
+    }
+
+    oldctx = MemoryContextSwitchTo(ggctx->properties_mcxt);
+    copy = PointerGetDatum(PG_DETOAST_DATUM_COPY(properties));
+    MemoryContextSwitchTo(oldctx);
+
+    return copy;
+}
+
 /*
  * RLS-aware loader for a single vertex label table.
  *
- * Loads (id, ctid) through SPI so the planner applies row-level security
+ * Loads the visible rows through SPI so the planner applies row-level security
  * policies (and table/column ACL) for the current role, then inserts each
- * visible row into the graph's global vertex hashtable. The physical tuple
- * location (ctid) is stored for the same lazy property fetch the direct-scan
- * path uses (get_vertex_entry_properties); because only RLS-visible rows are
- * loaded, that later heap_fetch only ever reads authorized tuples. Used in
- * place of the direct heap scan when age.enforce_rls_in_traversal is on and RLS
- * is active on the label table. Rows are fetched in batches so the entire label
- * table is never materialized at once.
+ * visible row into the graph's global vertex hashtable. A role with SELECT on
+ * the table loads (id, ctid) and the physical tuple location is stored for the
+ * same lazy property fetch the direct-scan path uses
+ * (get_vertex_entry_properties); because only RLS-visible rows are loaded, that
+ * later heap_fetch only ever reads authorized tuples. A role holding only
+ * column privileges cannot read ctid, so it loads (id, properties) and the
+ * entry keeps a copy of the properties. Used in place of the direct heap scan
+ * when age.enforce_rls_in_traversal is on and RLS is active on the label table.
+ * Rows are fetched in batches so the entire label table is never materialized
+ * at once.
  */
 static void load_vertex_label_rls(GRAPH_global_context *ggctx,
                                   Oid vertex_label_table_oid,
@@ -807,6 +1062,11 @@ static void load_vertex_label_rls(GRAPH_global_context *ggctx,
     StringInfoData query;
     SPIPlanPtr plan;
     Portal portal;
+    bool keep_properties;
+
+    /* column privileges cover the user columns but not ctid */
+    keep_properties = (pg_class_aclcheck(vertex_label_table_oid, GetUserId(),
+                                         ACL_SELECT) != ACLCHECK_OK);
 
     if (SPI_connect() != SPI_OK_CONNECT)
     {
@@ -824,7 +1084,8 @@ static void load_vertex_label_rls(GRAPH_global_context *ggctx,
      * cache rebuild.
      */
     initStringInfo(&query);
-    appendStringInfo(&query, "SELECT id, ctid FROM ONLY %s",
+    appendStringInfo(&query, "SELECT id, %s FROM ONLY %s",
+                     keep_properties ? "properties" : "ctid",
                      quote_qualified_identifier(ggctx->graph_name,
                                                 vertex_label_name));
 
@@ -835,6 +1096,11 @@ static void load_vertex_label_rls(GRAPH_global_context *ggctx,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("load_vertex_label_rls: SPI_prepare failed: %s",
                         SPI_result_code_string(SPI_result))));
+    }
+
+    if (rls_plan_quals_vary(plan))
+    {
+        ggctx->rls_quals_vary = true;
     }
 
     /* read-only cursor: reuses the active snapshot; RLS applied by planner */
@@ -857,24 +1123,39 @@ static void load_vertex_label_rls(GRAPH_global_context *ggctx,
             TupleDesc tupdesc = SPI_tuptable->tupdesc;
             bool isnull = false;
             graphid vertex_id;
-            ItemPointer tidptr;
+            Datum value;
             ItemPointerData tid;
+            Datum properties = (Datum) 0;
             MemoryContext oldctx;
 
             vertex_id = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 1,
                                                     &isnull));
-            tidptr = (ItemPointer) DatumGetPointer(SPI_getbinval(tuple, tupdesc,
-                                                                 2, &isnull));
-            /* ctid is never null for a scanned heap tuple; guard defensively */
-            if (isnull || tidptr == NULL)
+            value = SPI_getbinval(tuple, tupdesc, 2, &isnull);
+            ItemPointerSetInvalid(&tid);
+
+            if (keep_properties)
             {
-                continue;
+                if (isnull)
+                {
+                    elog(ERROR, "load_vertex_label_rls: vertex " INT64_FORMAT
+                         " has null properties", vertex_id);
+                }
+                properties = copy_entry_properties(ggctx, ggctx_cxt, value);
             }
-            tid = *tidptr;
+            else
+            {
+                /* ctid is never null for a scanned heap tuple; guard defensively */
+                if (isnull || DatumGetPointer(value) == NULL)
+                {
+                    continue;
+                }
+                tid = *((ItemPointer) DatumGetPointer(value));
+            }
 
             /* build the entry in the cache's (persistent) memory context */
             oldctx = MemoryContextSwitchTo(ggctx_cxt);
-            insert_vertex_entry(ggctx, vertex_id, vertex_label_table_oid, tid);
+            insert_vertex_entry(ggctx, vertex_id, vertex_label_table_oid, tid,
+                                properties);
             MemoryContextSwitchTo(oldctx);
         }
 
@@ -889,7 +1170,8 @@ static void load_vertex_label_rls(GRAPH_global_context *ggctx,
  * RLS-aware loader for a single edge label table. See load_vertex_label_rls;
  * this variant additionally loads start_id/end_id and populates the per-vertex
  * edge lists, exactly like the direct-scan path, storing the ctid for the same
- * lazy property fetch.
+ * lazy property fetch, or a copy of the properties for a role that holds only
+ * column privileges.
  */
 static void load_edge_label_rls(GRAPH_global_context *ggctx,
                                 Oid edge_label_table_oid,
@@ -899,6 +1181,11 @@ static void load_edge_label_rls(GRAPH_global_context *ggctx,
     StringInfoData query;
     SPIPlanPtr plan;
     Portal portal;
+    bool keep_properties;
+
+    /* column privileges cover the user columns but not ctid */
+    keep_properties = (pg_class_aclcheck(edge_label_table_oid, GetUserId(),
+                                         ACL_SELECT) != ACLCHECK_OK);
 
     if (SPI_connect() != SPI_OK_CONNECT)
     {
@@ -913,7 +1200,8 @@ static void load_edge_label_rls(GRAPH_global_context *ggctx,
      */
     initStringInfo(&query);
     appendStringInfo(&query,
-                     "SELECT id, start_id, end_id, ctid FROM ONLY %s",
+                     "SELECT id, start_id, end_id, %s FROM ONLY %s",
+                     keep_properties ? "properties" : "ctid",
                      quote_qualified_identifier(ggctx->graph_name,
                                                 edge_label_name));
 
@@ -924,6 +1212,11 @@ static void load_edge_label_rls(GRAPH_global_context *ggctx,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("load_edge_label_rls: SPI_prepare failed: %s",
                         SPI_result_code_string(SPI_result))));
+    }
+
+    if (rls_plan_quals_vary(plan))
+    {
+        ggctx->rls_quals_vary = true;
     }
 
     /* read-only cursor: reuses the active snapshot; RLS applied by planner */
@@ -948,8 +1241,9 @@ static void load_edge_label_rls(GRAPH_global_context *ggctx,
             graphid edge_id;
             graphid edge_vertex_start_id;
             graphid edge_vertex_end_id;
-            ItemPointer tidptr;
+            Datum value;
             ItemPointerData tid;
+            Datum properties = (Datum) 0;
             MemoryContext oldctx;
 
             edge_id = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 1, &isnull));
@@ -957,14 +1251,26 @@ static void load_edge_label_rls(GRAPH_global_context *ggctx,
                                                                2, &isnull));
             edge_vertex_end_id = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 3,
                                                              &isnull));
-            tidptr = (ItemPointer) DatumGetPointer(SPI_getbinval(tuple, tupdesc,
-                                                                 4, &isnull));
-            /* ctid is never null for a scanned heap tuple; guard defensively */
-            if (isnull || tidptr == NULL)
+            value = SPI_getbinval(tuple, tupdesc, 4, &isnull);
+            ItemPointerSetInvalid(&tid);
+
+            if (keep_properties)
             {
-                continue;
+                if (isnull)
+                {
+                    elog(ERROR, "load_edge_label_rls: edge " INT64_FORMAT
+                         " has null properties", edge_id);
+                }
             }
-            tid = *tidptr;
+            else
+            {
+                /* ctid is never null for a scanned heap tuple; guard defensively */
+                if (isnull || DatumGetPointer(value) == NULL)
+                {
+                    continue;
+                }
+                tid = *((ItemPointer) DatumGetPointer(value));
+            }
 
             /*
              * If a vertex label was RLS-filtered, drop any edge whose start or
@@ -978,10 +1284,16 @@ static void load_edge_label_rls(GRAPH_global_context *ggctx,
                 continue;
             }
 
+            if (keep_properties)
+            {
+                properties = copy_entry_properties(ggctx, ggctx_cxt, value);
+            }
+
             /* build the entries in the cache's (persistent) memory context */
             oldctx = MemoryContextSwitchTo(ggctx_cxt);
-            insert_edge_entry(ggctx, edge_id, tid, edge_vertex_start_id,
-                              edge_vertex_end_id, edge_label_table_oid);
+            insert_edge_entry(ggctx, edge_id, tid, properties,
+                              edge_vertex_start_id, edge_vertex_end_id,
+                              edge_label_table_oid);
             insert_vertex_edge(ggctx, edge_vertex_start_id,
                                edge_vertex_end_id, edge_id, edge_label_name);
             MemoryContextSwitchTo(oldctx);
@@ -1059,6 +1371,24 @@ static void enforce_label_table_select_acl(Oid label_table_oid)
     }
 }
 
+/*
+ * The RLS loaders evaluate the policies in whichever process loads the graph.
+ * A parallel worker does not have all of the caller's session state (for
+ * example, inet_client_addr() is NULL there), so a policy could admit rows in
+ * a worker that it hides from the caller. Refuse to load an RLS-protected label
+ * during a parallel operation.
+ */
+static void prevent_rls_load_in_parallel_mode(void)
+{
+    if (IsInParallelMode())
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+                 errmsg("cannot load row-level security protected graph data during a parallel operation"),
+                 errhint("Run the query without parallelism, for example with SET max_parallel_workers_per_gather = 0.")));
+    }
+}
+
 /* helper routine to load all vertices into the GRAPH global vertex hashtable */
 static void load_vertex_hashtable(GRAPH_global_context *ggctx)
 {
@@ -1123,6 +1453,7 @@ static void load_vertex_hashtable(GRAPH_global_context *ggctx)
                 check_enable_rls(vertex_label_table_oid, InvalidOid, true) ==
                     RLS_ENABLED)
             {
+                prevent_rls_load_in_parallel_mode();
                 load_vertex_label_rls(ggctx, vertex_label_table_oid,
                                       vertex_label_name);
                 /*
@@ -1167,7 +1498,7 @@ static void load_vertex_hashtable(GRAPH_global_context *ggctx)
                 /* insert vertex into vertex hashtable with TID (no property copy) */
                 inserted = insert_vertex_entry(ggctx, vertex_id,
                                                vertex_label_table_oid,
-                                               tuple->t_self);
+                                               tuple->t_self, (Datum) 0);
 
                 /* warn if there is a duplicate */
                 if (!inserted)
@@ -1283,6 +1614,7 @@ static void load_edge_hashtable(GRAPH_global_context *ggctx)
                 check_enable_rls(edge_label_table_oid, InvalidOid, true) ==
                     RLS_ENABLED)
             {
+                prevent_rls_load_in_parallel_mode();
                 load_edge_label_rls(ggctx, edge_label_table_oid, edge_label_name);
                 ggctx->loaded_with_rls = true;
                 continue;
@@ -1344,6 +1676,7 @@ static void load_edge_hashtable(GRAPH_global_context *ggctx)
 
                 /* insert edge into edge hashtable with TID (no property copy) */
                 inserted = insert_edge_entry(ggctx, edge_id, tuple->t_self,
+                                             (Datum) 0,
                                              edge_vertex_start_id,
                                              edge_vertex_end_id,
                                              edge_label_table_oid);
@@ -1472,6 +1805,13 @@ static bool free_specific_GRAPH_global_context(GRAPH_global_context *ggctx)
     if (ggctx->edge_table_mcxt != NULL)
     {
         MemoryContextDelete(ggctx->edge_table_mcxt);
+    }
+
+    /* property copies kept for column-privilege RLS loads */
+    if (ggctx->properties_mcxt != NULL)
+    {
+        MemoryContextDelete(ggctx->properties_mcxt);
+        ggctx->properties_mcxt = NULL;
     }
 
     ggctx->vertex_hashtable = NULL;
@@ -1608,6 +1948,15 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
         {
             bool success = false;
 
+            /* a query still using it keeps it; it is freed when unpinned */
+            if (curr_ggctx->pin_count > 0)
+            {
+                curr_ggctx->retired = true;
+                prev_ggctx = curr_ggctx;
+                curr_ggctx = next_ggctx;
+                continue;
+            }
+
             /*
              * If prev_ggctx is NULL then we are freeing the top of the
              * contexts. So, we need to point the contexts variable to the
@@ -1646,7 +1995,7 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
     curr_ggctx = global_graph_contexts;
     while (curr_ggctx != NULL)
     {
-        if (curr_ggctx->graph_oid == graph_oid)
+        if (curr_ggctx->graph_oid == graph_oid && !curr_ggctx->retired)
         {
             /* switch our context back */
             MemoryContextSwitchTo(oldctx);
@@ -1736,47 +2085,60 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
      * through a SECURITY DEFINER RLS policy can attach a context loaded as a
      * different role; returning it here would expose rows the current role may
      * not be allowed to see. If the existing context is not reusable, detach
-     * and discard it so the list keeps a single, correct context per graph.
+     * and discard it so the list keeps a single, correct context per graph;
+     * a context that a query still pins is retired instead.
      */
     prev_ggctx = NULL;
     curr_ggctx = global_graph_contexts;
     while (curr_ggctx != NULL)
     {
-        if (curr_ggctx->graph_oid == graph_oid)
-        {
-            if (!is_ggctx_invalid(curr_ggctx))
-            {
-                (void) free_specific_GRAPH_global_context(new_ggctx);
-                MemoryContextSwitchTo(oldctx);
-                return curr_ggctx;
-            }
+        GRAPH_global_context *next_ggctx = curr_ggctx->next;
 
-            /* detach the incompatible context and discard it */
-            if (prev_ggctx == NULL)
-            {
-                global_graph_contexts = curr_ggctx->next;
-            }
-            else
-            {
-                prev_ggctx->next = curr_ggctx->next;
-            }
-            if (!free_specific_GRAPH_global_context(curr_ggctx))
-            {
-                /*
-                 * The detached context was internally inconsistent (a
-                 * vertex or edge entry went missing). Free our freshly-
-                 * built context first so it does not leak, then surface
-                 * the corruption as the other cleanup paths in this file
-                 * do.
-                 */
-                (void) free_specific_GRAPH_global_context(new_ggctx);
-                ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
-                                errmsg("missing vertex or edge entry during free")));
-            }
-            break;
+        if (curr_ggctx->graph_oid != graph_oid || curr_ggctx->retired)
+        {
+            prev_ggctx = curr_ggctx;
+            curr_ggctx = next_ggctx;
+            continue;
         }
-        prev_ggctx = curr_ggctx;
-        curr_ggctx = curr_ggctx->next;
+
+        if (!is_ggctx_invalid(curr_ggctx))
+        {
+            (void) free_specific_GRAPH_global_context(new_ggctx);
+            MemoryContextSwitchTo(oldctx);
+            return curr_ggctx;
+        }
+
+        if (curr_ggctx->pin_count > 0)
+        {
+            curr_ggctx->retired = true;
+            prev_ggctx = curr_ggctx;
+            curr_ggctx = next_ggctx;
+            continue;
+        }
+
+        /* detach the incompatible context and discard it */
+        if (prev_ggctx == NULL)
+        {
+            global_graph_contexts = next_ggctx;
+        }
+        else
+        {
+            prev_ggctx->next = next_ggctx;
+        }
+        if (!free_specific_GRAPH_global_context(curr_ggctx))
+        {
+            /*
+             * The detached context was internally inconsistent (a
+             * vertex or edge entry went missing). Free our freshly-
+             * built context first so it does not leak, then surface
+             * the corruption as the other cleanup paths in this file
+             * do.
+             */
+            (void) free_specific_GRAPH_global_context(new_ggctx);
+            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
+                            errmsg("missing vertex or edge entry during free")));
+        }
+        curr_ggctx = next_ggctx;
     }
 
     /* prepend our freshly-built context to the shared list */
@@ -1791,12 +2153,12 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
 
 /*
  * Helper function to delete all of the global graph contexts used by the
- * process. When done the global global_graph_contexts will be NULL.
- *
- *
+ * process. Contexts that a query still pins are retired instead and freed
+ * when the last pin is released.
  */
 static bool delete_GRAPH_global_contexts(void)
 {
+    GRAPH_global_context *prev_ggctx = NULL;
     GRAPH_global_context *curr_ggctx = NULL;
     bool retval = false;
 
@@ -1809,6 +2171,25 @@ static bool delete_GRAPH_global_contexts(void)
     {
         GRAPH_global_context *next_ggctx = curr_ggctx->next;
         bool success = false;
+
+        retval = true;
+
+        if (curr_ggctx->pin_count > 0)
+        {
+            curr_ggctx->retired = true;
+            prev_ggctx = curr_ggctx;
+            curr_ggctx = next_ggctx;
+            continue;
+        }
+
+        if (prev_ggctx == NULL)
+        {
+            global_graph_contexts = next_ggctx;
+        }
+        else
+        {
+            prev_ggctx->next = next_ggctx;
+        }
 
         /* free the current graph context */
         success = free_specific_GRAPH_global_context(curr_ggctx);
@@ -1823,26 +2204,21 @@ static bool delete_GRAPH_global_contexts(void)
 
         /* advance to the next context */
         curr_ggctx = next_ggctx;
-
-        retval = true;
     }
-
-    /* reset the head of the contexts to NULL */
-    global_graph_contexts = NULL;
-
 
     return retval;
 }
 
 /*
- * Helper function to delete a specific global graph context used by the
- * process.
+ * Helper function to delete the global graph contexts of a specific graph.
+ * Contexts that a query still pins are retired instead.
  */
 static bool delete_specific_GRAPH_global_contexts(char *graph_name)
 {
     GRAPH_global_context *prev_ggctx = NULL;
     GRAPH_global_context *curr_ggctx = NULL;
     Oid graph_oid = InvalidOid;
+    bool found = false;
 
     if (graph_name == NULL)
     {
@@ -1856,7 +2232,7 @@ static bool delete_specific_GRAPH_global_contexts(char *graph_name)
     /* get the first context, if any */
     curr_ggctx = global_graph_contexts;
 
-    /* find the specified GRAPH global context */
+    /* find the specified GRAPH global contexts */
     while (curr_ggctx != NULL)
     {
         GRAPH_global_context *next_ggctx = curr_ggctx->next;
@@ -1864,6 +2240,17 @@ static bool delete_specific_GRAPH_global_contexts(char *graph_name)
         if (curr_ggctx->graph_oid == graph_oid)
         {
             bool success = false;
+
+            found = true;
+
+            if (curr_ggctx->pin_count > 0)
+            {
+                curr_ggctx->retired = true;
+                prev_ggctx = curr_ggctx;
+                curr_ggctx = next_ggctx;
+                continue;
+            }
+
             /*
              * If prev_ggctx is NULL then we are freeing the top of the
              * contexts. So, we need to point the global variable to the
@@ -1875,7 +2262,7 @@ static bool delete_specific_GRAPH_global_contexts(char *graph_name)
             }
             else
             {
-                prev_ggctx->next = curr_ggctx->next;
+                prev_ggctx->next = next_ggctx;
             }
 
             /* free the current graph context */
@@ -1889,8 +2276,8 @@ static bool delete_specific_GRAPH_global_contexts(char *graph_name)
                                 errmsg("missing vertex_entry during free")));
             }
 
-            /* we found and freed it, return true */
-            return true;
+            curr_ggctx = next_ggctx;
+            continue;
         }
 
         /* save the current as previous and advance to the next one */
@@ -1898,9 +2285,7 @@ static bool delete_specific_GRAPH_global_contexts(char *graph_name)
         curr_ggctx = next_ggctx;
     }
 
-
-    /* we didn't find it, return false */
-    return false;
+    return found;
 }
 
 /*
@@ -1965,7 +2350,7 @@ GRAPH_global_context *find_GRAPH_global_context(Oid graph_oid)
     while(ggctx != NULL)
     {
         /* if we found it return it */
-        if (ggctx->graph_oid == graph_oid)
+        if (ggctx->graph_oid == graph_oid && !ggctx->retired)
         {
 
             return ggctx;
@@ -1978,6 +2363,233 @@ GRAPH_global_context *find_GRAPH_global_context(Oid graph_oid)
 
     /* we did not find it so return NULL */
     return NULL;
+}
+
+/*
+ * Find a graph context for materializing a VLE path. The path may come from a
+ * traversal whose context has since been retired, so retired contexts that a
+ * query still pins are considered too. The first context that holds every
+ * vertex and edge of the path is returned, or NULL if there is none.
+ */
+GRAPH_global_context *find_GRAPH_global_context_for_path(Oid graph_oid,
+                                                         const graphid *ids,
+                                                         int64 count)
+{
+    GRAPH_global_context *ggctx = NULL;
+
+    for (ggctx = global_graph_contexts; ggctx != NULL; ggctx = ggctx->next)
+    {
+        bool complete = true;
+        int64 i;
+
+        if (ggctx->graph_oid != graph_oid)
+        {
+            continue;
+        }
+
+        for (i = 0; i < count; i++)
+        {
+            /*
+             * get_edge_entry() asserts that the edge exists; a context may
+             * lack it here, so look the edge up directly.
+             */
+            if ((i % 2 == 0 && get_vertex_entry(ggctx, ids[i]) == NULL) ||
+                (i % 2 == 1 &&
+                 agehash_lookup(ggctx->edge_table, &ids[i]) == NULL))
+            {
+                complete = false;
+                break;
+            }
+        }
+
+        if (complete)
+        {
+            return ggctx;
+        }
+    }
+
+    return NULL;
+}
+
+/* remove a context from the backend-local list without freeing it */
+static void unlink_GRAPH_global_context(GRAPH_global_context *ggctx)
+{
+    GRAPH_global_context **link = &global_graph_contexts;
+
+    while (*link != NULL && *link != ggctx)
+    {
+        link = &(*link)->next;
+    }
+
+    if (*link == ggctx)
+    {
+        *link = ggctx->next;
+    }
+
+    ggctx->next = NULL;
+}
+
+/*
+ * Memory-context callback for a pin. Runs when the query's memory context is
+ * reset or deleted, including during error cleanup. A retired context is
+ * freed once no query pins it. It only uses pfree, hash_destroy and
+ * MemoryContextDelete, so it is safe in an aborted transaction.
+ */
+static void release_GRAPH_context_pin(void *arg)
+{
+    GRAPH_context_pin *pin = (GRAPH_context_pin *) arg;
+    GRAPH_context_pin **link = &graph_context_pins;
+    GRAPH_global_context *ggctx = NULL;
+
+    while (*link != NULL && *link != pin)
+    {
+        link = &(*link)->next;
+    }
+
+    if (*link == NULL)
+    {
+        return;
+    }
+
+    *link = pin->next;
+    ggctx = pin->ggctx;
+
+    if (ggctx->pin_count > 0)
+    {
+        ggctx->pin_count--;
+    }
+
+    if (ggctx->pin_count == 0 && ggctx->retired)
+    {
+        unlink_GRAPH_global_context(ggctx);
+        (void) free_specific_GRAPH_global_context(ggctx);
+    }
+}
+
+/*
+ * Keep a graph context alive until the given per-query memory context goes
+ * away, recording the traversal call site that pinned it. Pinning the same
+ * context twice for one query is a no-op.
+ */
+void pin_GRAPH_global_context(GRAPH_global_context *ggctx, MemoryContext owner,
+                              const void *call_site)
+{
+    GRAPH_context_pin *pin = NULL;
+
+    if (ggctx == NULL || owner == NULL)
+    {
+        return;
+    }
+
+    for (pin = graph_context_pins; pin != NULL; pin = pin->next)
+    {
+        if (pin->ggctx == ggctx && pin->owner == owner)
+        {
+            return;
+        }
+    }
+
+    pin = MemoryContextAllocZero(owner, sizeof(GRAPH_context_pin));
+    pin->ggctx = ggctx;
+    pin->owner = owner;
+    pin->call_site = call_site;
+    pin->release.func = release_GRAPH_context_pin;
+    pin->release.arg = pin;
+    MemoryContextRegisterResetCallback(owner, &pin->release);
+
+    pin->next = graph_context_pins;
+    graph_context_pins = pin;
+    ggctx->pin_count++;
+}
+
+/*
+ * Whether a graph context this query already pins can serve another
+ * acquisition in the same query, under the semantics PostgreSQL gives a
+ * statement's scans:
+ *
+ * - A context loaded with another role, enforcement setting or snapshot is a
+ *   different scan.
+ * - A later command id means that a traversal which has not loaded the graph
+ *   yet must see the statement's own writes. The traversal that loaded it
+ *   keeps it while the statement writes, as a traversal of a graph without
+ *   RLS does, instead of loading the graph again for every row.
+ * - Policies and privileges hold for the whole statement: PostgreSQL applies
+ *   the policies when it plans the statement and checks the privileges when
+ *   it starts it, so an authorization change made while the statement runs
+ *   does not end the reuse.
+ * - When the RLS quals give the same result throughout the statement, every
+ *   scan of the labels in this statement returns the same rows, so any
+ *   traversal may share the graph (see rls_plan_quals_vary).
+ * - Otherwise only the traversal call site that loaded the graph shares it,
+ *   as when PostgreSQL scans a relation once and rescans the result. Another
+ *   call site is a separate scan and evaluates the policies itself.
+ */
+static bool graph_context_reusable(GRAPH_context_pin *pin,
+                                   const void *call_site)
+{
+    GRAPH_global_context *ggctx = pin->ggctx;
+    Snapshot snapshot = GetActiveSnapshot();
+
+    if (ggctx->load_as_role != GetUserId() ||
+        ggctx->loaded_rls_enforced != age_enforce_rls_in_traversal ||
+        ggctx->xmin != snapshot->xmin ||
+        ggctx->xmax != snapshot->xmax)
+    {
+        return false;
+    }
+
+    if (ggctx->curcid != snapshot->curcid &&
+        (call_site == NULL || pin->call_site != call_site))
+    {
+        return false;
+    }
+
+    if (ggctx->rls_quals_vary &&
+        (call_site == NULL || pin->call_site != call_site))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * Acquire a graph context for a traversal and pin it for the rest of the
+ * query that owns query_owner, so a later acquisition cannot free it while
+ * the traversal or the materialization of its results still needs it.
+ * call_site identifies the traversal within the query; it stays the same
+ * when the traversal is evaluated again for another row. A context the query
+ * already pins is reused when graph_context_reusable() allows it, so the
+ * policies run once for each row a load scans rather than again for every
+ * traversal.
+ */
+GRAPH_global_context *acquire_GRAPH_global_context(char *graph_name,
+                                                   Oid graph_oid,
+                                                   MemoryContext query_owner,
+                                                   const void *call_site)
+{
+    GRAPH_global_context *ggctx = NULL;
+    GRAPH_context_pin *pin = NULL;
+
+    if (query_owner == NULL)
+    {
+        return manage_GRAPH_global_contexts(graph_name, graph_oid);
+    }
+
+    for (pin = graph_context_pins; pin != NULL; pin = pin->next)
+    {
+        if (pin->owner == query_owner &&
+            pin->ggctx->graph_oid == graph_oid &&
+            graph_context_reusable(pin, call_site))
+        {
+            return pin->ggctx;
+        }
+    }
+
+    ggctx = manage_GRAPH_global_contexts(graph_name, graph_oid);
+    pin_GRAPH_global_context(ggctx, query_owner, call_site);
+
+    return ggctx;
 }
 
 /* graph vertices accessor */
@@ -2128,7 +2740,14 @@ Datum get_vertex_entry_properties(vertex_entry *ve)
     Datum result;
     entry_fetch_status status;
 
-    result = fetch_entry_properties(ve->vertex_label_table_oid, &ve->tid,
+    /* properties kept at load time; return the caller its own copy */
+    if (ve->has_properties)
+    {
+        return datumCopy(ve->storage.properties, false, -1);
+    }
+
+    result = fetch_entry_properties(ve->vertex_label_table_oid,
+                                    &ve->storage.tid,
                                     ve->vertex_id,
                                     Anum_ag_label_vertex_table_id,
                                     Anum_ag_label_vertex_table_properties,
@@ -2177,7 +2796,14 @@ Datum get_edge_entry_properties(edge_entry *ee)
     Datum result;
     entry_fetch_status status;
 
-    result = fetch_entry_properties(ee->edge_label_table_oid, &ee->tid,
+    /* properties kept at load time; return the caller its own copy */
+    if (ee->has_properties)
+    {
+        return datumCopy(ee->storage.properties, false, -1);
+    }
+
+    result = fetch_entry_properties(ee->edge_label_table_oid,
+                                    &ee->storage.tid,
                                     get_edge_entry_id(ee),
                                     Anum_ag_label_edge_table_id,
                                     Anum_ag_label_edge_table_properties,
@@ -2312,6 +2938,17 @@ Datum age_vertex_stats(PG_FUNCTION_ARGS)
 
     /* get the vertex entry */
     ve = get_vertex_entry(ggctx, vid);
+
+    /*
+     * The vertex is absent from the graph the caller can traverse, for
+     * example when row-level security hides it while an untyped MATCH, which
+     * scans the parent label table, still returns it. There are no
+     * statistics for it.
+     */
+    if (ve == NULL)
+    {
+        PG_RETURN_NULL();
+    }
 
     /* zero the state */
     memset(&result, 0, sizeof(agtype_in_state));
