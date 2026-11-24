@@ -1803,6 +1803,7 @@ static agtype_value *build_edge_list(VLE_path_container *vpc)
         ee = get_edge_entry(ggctx, graphid_array[index]);
         /* get the label name from the oid */
         label_name = get_rel_name(get_edge_entry_label_table_oid(ee));
+        label_name = get_display_label_name(label_name);
         /* reconstruct the edge */
         agtv_edge = agtype_value_build_edge(get_edge_entry_id(ee), label_name,
                                             get_edge_entry_end_vertex_id(ee),
@@ -1874,6 +1875,7 @@ static agtype_value *build_path(VLE_path_container *vpc)
         ve = get_vertex_entry(ggctx, graphid_array[index]);
         /* get the label name from the oid */
         label_name = get_rel_name(get_vertex_entry_label_table_oid(ve));
+        label_name = get_display_label_name(label_name);
         /* reconstruct the vertex */
         agtv_vertex = agtype_value_build_vertex(get_vertex_entry_id(ve),
                                                 label_name,
@@ -1895,6 +1897,7 @@ static agtype_value *build_path(VLE_path_container *vpc)
         ee = get_edge_entry(ggctx, graphid_array[index+1]);
         /* get the label name from the oid */
         label_name = get_rel_name(get_edge_entry_label_table_oid(ee));
+        label_name = get_display_label_name(label_name);
         /* reconstruct the edge */
         agtv_edge = agtype_value_build_edge(get_edge_entry_id(ee), label_name,
                                             get_edge_entry_end_vertex_id(ee),
@@ -1972,7 +1975,8 @@ Datum age_vle(PG_FUNCTION_ARGS)
         /* all of these arguments need to be non NULL */
         if (PG_ARGISNULL(0) || /* graph name */
             PG_ARGISNULL(3) || /* edge prototype */
-            PG_ARGISNULL(6))   /* direction */
+            PG_ARGISNULL(6) || /* direction */
+            (PG_NARGS() == 8 && PG_ARGISNULL(7))) /* VLE grammar node id */
         {
              ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),

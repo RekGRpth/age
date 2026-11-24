@@ -6134,6 +6134,7 @@ static Datum get_vertex(const char *graph, const char *vertex_label,
     Oid graph_namespace_oid;
     Oid vertex_label_table_oid;
     Snapshot snapshot;
+    CommandId saved_curcid;
 
     /* get the specific graph namespace (schema) */
     graph_namespace_oid = get_namespace_oid(graph, false);
@@ -6150,6 +6151,26 @@ static Datum get_vertex(const char *graph, const char *vertex_label,
     {
         aclcheck_error(aclresult, OBJECT_TABLE, vertex_label);
     }
+
+    /*
+     * Temporarily advance the snapshot's curcid so that vertices written
+     * by preceding clauses (e.g., SET) in the same query are visible.
+     * When this runs inside a cypher query, the active snapshot is the
+     * executor's es_snapshot, whose curcid the clause machinery manages
+     * manually. CommandCounterIncrement() calls made outside that
+     * machinery, e.g., by statements executed inside a function called
+     * with CALL, advance the global command id without advancing this
+     * snapshot's curcid, which would leave it behind the command id
+     * that stamped those writes and make this scan return the
+     * pre-update tuple.
+     *
+     * Use Max to ensure we never decrease curcid. Visibility is decided
+     * when the tuple is fetched below, so restore the original curcid
+     * right after the fetch, before any error path can leave it raised.
+     * Same pattern as entity_exists() in cypher_utils.c.
+     */
+    saved_curcid = snapshot->curcid;
+    snapshot->curcid = Max(saved_curcid, GetCurrentCommandId(false));
 
     /* open the relation (table) */
     graph_vertex_label = table_open(vertex_label_table_oid, ShareLock);
@@ -6191,6 +6212,9 @@ static Datum get_vertex(const char *graph, const char *vertex_label,
         scan_desc = table_beginscan(graph_vertex_label, snapshot, 1, scan_keys);
         tuple = heap_getnext(scan_desc, ForwardScanDirection);
     }
+
+    /* the fetch decided visibility; restore the snapshot's curcid */
+    snapshot->curcid = saved_curcid;
 
     /* bail if the tuple isn't valid */
     if (!HeapTupleIsValid(tuple))
@@ -6239,7 +6263,8 @@ static Datum get_vertex(const char *graph, const char *vertex_label,
     properties = column_get_datum(tupdesc, tuple, 1, "properties",
                                   AGTYPEOID, true);
     /* reconstruct the vertex */
-    label_agtype = DATUM_GET_AGTYPE_P(string_to_agtype((char *)vertex_label));
+    label_agtype = DATUM_GET_AGTYPE_P(
+        string_to_agtype(get_display_label_name((char *)vertex_label)));
     result = DirectFunctionCall3(_agtype_build_vertex, id,
                                  PointerGetDatum(label_agtype), properties);
 
@@ -11525,6 +11550,16 @@ Datum age_float8_stddev_samp_aggfinalfn(PG_FUNCTION_ARGS)
     PGFunction func;
     agtype_value agtv_float;
 
+    /*
+     * The function is not STRICT, so it can be called directly with a NULL
+     * state. float8_stddev_samp does not check for that and would dereference
+     * it, so return NULL here, as a STRICT function would.
+     */
+    if (PG_ARGISNULL(0))
+    {
+        PG_RETURN_NULL();
+    }
+
     /* we can't use DirectFunctionCall1 as it errors for NULL values */
     func = float8_stddev_samp;
     result = (*func) (fcinfo);
@@ -11556,6 +11591,12 @@ Datum age_float8_stddev_pop_aggfinalfn(PG_FUNCTION_ARGS)
     Datum result;
     PGFunction func;
     agtype_value agtv_float;
+
+    /* same as above, float8_stddev_pop does not check for a NULL state */
+    if (PG_ARGISNULL(0))
+    {
+        PG_RETURN_NULL();
+    }
 
     /* we can't use DirectFunctionCall1 as it errors for NULL values */
     func = float8_stddev_pop;
